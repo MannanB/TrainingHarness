@@ -3,7 +3,7 @@
 Supports local training and runpod.io serverless. Designed for ablation testing and small-scale training.
 Uses wandb for logging for uploading models (HF Hub integration is planned)
 
-## Setup:
+## Setup
 
 1. Clone this repo
 2. Create a .env file following the .env.example and populate it with required API keys (you can leave runpod stuff blank if local training). Make sure you make a wandb project
