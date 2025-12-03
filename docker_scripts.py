@@ -2,9 +2,14 @@
 # python docker_scripts.py --build_push_base
 # python docker_scripts.py --build_push_container
 import subprocess
+import os
 
-def build_and_push_base():
-    base_image_tag = "mannanb/mltraining:latest"
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def build_and_push_base(username):
+    base_image_tag = f"{username}/mltraining:latest"
     base_dockerfile_path = "./base"
     
     # Build the base image
@@ -20,8 +25,8 @@ def build_and_push_base():
         "docker", "push", base_image_tag
     ], check=True)
 
-def build_and_push_container():
-    container_image_tag = "mannanb/runpodserverless:latest"
+def build_and_push_container(username):
+    container_image_tag = f"{username}/runpodserverless:latest"
     container_dockerfile_path = "./container"
     
     # Build the container image
@@ -43,6 +48,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build and push Docker images.")
     parser.add_argument("--build_push_base", action="store_true", help="Build and push the base image.")
     parser.add_argument("--build_push_container", action="store_true", help="Build and push the container image.")
+    parser.add_argument("--username", type=str, help="Docker Hub username.")
     
     args = parser.parse_args()
     
