@@ -110,7 +110,6 @@ def handle_docker(args):
 
 def cloud_run(exp_cfg):
     runpod.api_key = os.environ.get("RUNPOD_API_KEY")
-    ENDPOINT_ID = os.environ.get("ENDPOINT_ID")
 
     print(f"Submitting job to Runpod Endpoint {ENDPOINT_ID}...")
 
