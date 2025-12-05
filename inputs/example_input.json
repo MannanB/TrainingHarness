@@ -6,7 +6,7 @@
         "run_name": "mnist_test_run_03",
         "project_name": "mnist",
         "config": {
-            "num_epochs": 1
+            "num_epochs": 3
         }
     }
 }

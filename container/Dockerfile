@@ -4,6 +4,7 @@ FROM mannanb/mltraining:latest
 
 WORKDIR /
 COPY rp_handler.py /
+COPY ./projects /projects
 
 CMD ["python3", "-u", "/rp_handler.py"]
 

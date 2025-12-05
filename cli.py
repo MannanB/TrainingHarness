@@ -5,6 +5,7 @@ import os
 import json
 import runpod
 import requests
+import time
 
 from dotenv import load_dotenv
 
@@ -49,7 +50,7 @@ def build_image(target):
         run_cmd(f"docker build --platform linux/amd64 -t {IMAGE_BASE} ./base")
     elif target in ["container", "runpod"]:
         # runpod is practically an alias for container for docker stuff specifically
-        run_cmd(f"docker build --platform linux/amd64 -t {IMAGE_CONTAINER} ./base")
+        run_cmd(f"docker build --platform linux/amd64 -t {IMAGE_CONTAINER} ./container")
 
 def push_image(target):
     if target == "base":
@@ -58,42 +59,25 @@ def push_image(target):
         run_cmd(f"docker push {IMAGE_CONTAINER}")
 
 def update_runpod_endpoint():
-    api_key = os.environ.get("RUNPOD_API_KEY")
-    if not api_key:
-        log("RUNPOD_API_KEY not found in environment variables.", "error")
-        sys.exit(1)
-
-    log(f"Triggering update for Endpoint: {ENDPOINT_ID}...")
-
-    # We update the endpoint with the SAME image name.
-    # This forces Runpod to pull the latest version of that tag.
-    query = f'''
-    mutation {{
-      updateEndpoint(
-        input: {{
-          id: "{ENDPOINT_ID}",
-          imageName: "{IMAGE_CONTAINER}"
-        }}
-      ) {{
-        id
-        imageName
-      }}
-    }}'''
+    """
+    Triggers a rolling update on Runpod using runpodctl.
+    Requires runpodctl to be installed and configured.
+    """
+    log(f"Updating Endpoint {ENDPOINT_ID} to use image {IMAGE_CONTAINER}...")
     
-    response = requests.post(
-        "https://api.runpod.io/graphql",
-        json={'query': query},
-        headers={"Authorization": f"Bearer {api_key}"}
-    )
+    # Simple CLI command
+    command = f"runpodctl.exe serverless endpoint update {ENDPOINT_ID} --image-name {IMAGE_CONTAINER}"
     
-    if response.status_code == 200 and "errors" not in response.json():
-        log(f"Runpod Endpoint {ENDPOINT_ID} is updating workers.", "success")
-    else:
-        log(f"Failed to update Runpod: {response.text}", "error")
+    run_cmd(command)
+    log(f"Runpod update triggered successfully.", "success")
 
 def handle_docker(args):
     target = args.target # base, container, runpod
-    action = args.action # build, push, update
+    action = args.action # build, push, update, restart
+    
+    if target == "runpod" and action == "restart":
+        update_runpod_endpoint()
+        return
 
     # 1. Build Phase
     if action in ["build", "update"]:
@@ -115,18 +99,18 @@ def cloud_run(exp_cfg):
 
     # Submit the job. This is ASYNCHRONOUS.
     # It returns immediately with a job ID.
-    job_request = runpod.api.run_async(ENDPOINT_ID, exp_cfg)
-    job_id = job_request['id']
+    endpoint = runpod.Endpoint(ENDPOINT_ID)
+    job_request = endpoint.run(exp_cfg)
 
-    print(f"Job submitted! Job ID: {job_id}")
+    print(f"Job submitted!")
     print("Go to your W&B dashboard to monitor progress live.")
     print("Checking job status (will wait until complete)...")
 
     # Poll the job status until it's done
     while True:
-        status = runpod.api.job_status(job_id)
-        print(f"Job status: {status['status']}")
-        if status['status'] in ["COMPLETED", "FAILED"]:
+        status = job_request.status()
+        print(f"Job status: {status}")
+        if status in ["COMPLETED", "FAILED"]:
             print("\n--- Job Finished ---")
             print(status)
             break
@@ -139,6 +123,9 @@ def local_run(exp_cfg):
 def handle_jobs(args, extra_args):
     if args.action != "start":
         return
+    
+    with open(args.config, 'r') as f:
+        exp_cfg = json.load(f)
 
     wandb_api_key = os.environ.get("W&B_API_KEY")
     wandb_user_name = os.environ.get("W&B_USER_NAME")
@@ -168,7 +155,7 @@ if __name__ == "__main__":
     # --- Docker Command ---
     # Usage: python cli.py docker [build|push|update] [base|container|runpod]
     docker_parser = subparsers.add_parser("docker", help="Manage Docker Images")
-    docker_parser.add_argument("action", choices=["build", "push", "update"], help="Action to perform")
+    docker_parser.add_argument("action", choices=["build", "push", "update", "restart"], help="Action to perform")
     docker_parser.add_argument("target", choices=["base", "container", "runpod"], help="Target image")
 
     # --- Jobs Command ---
