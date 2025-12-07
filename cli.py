@@ -130,6 +130,7 @@ def handle_jobs(args, extra_args):
     wandb_api_key = os.environ.get("W&B_API_KEY")
     wandb_user_name = os.environ.get("W&B_USER_NAME")
     wandb_project_name = os.environ.get("W&B_PROJECT_NAME")
+    hf_api_token = os.environ.get("HF_API_TOKEN")
     # autofill null entities
     if wandb_api_key and not exp_cfg["input"].get('W&B_API_KEY'):
         exp_cfg["input"]['W&B_API_KEY'] = wandb_api_key
@@ -137,6 +138,9 @@ def handle_jobs(args, extra_args):
         exp_cfg["input"]['wandb_project_name'] = wandb_project_name
     if wandb_user_name and not exp_cfg["input"].get('wandb_user_name'):
         exp_cfg["input"]['wandb_user_name'] = wandb_user_name
+
+    if hf_api_token and not exp_cfg["input"]['config'].get('hf_token'):
+        exp_cfg["input"]['config']['hf_token'] = hf_api_token
 
     # print(f"Starting run {exp_cfg["input"].get('run_name', 'NO_RUN_NAME')} of project " +
     #       f"{exp_cfg["input"].get('project_name', 'NO_PROJECT_NAME')} (cloud={args.cloud})")

@@ -9,23 +9,29 @@ def handler(event):
     print(f"Worker Start")
     input = event['input']
 
-    os.environ['WANDB_API_KEY'] = input['W&B_API_KEY']
-
-    wandb.login()
-
-    wandb_project_name = input.get('wandb_project_name', 'default_wandb_project')
-    wandb_run_name = input.get('run_name', f'run_{int(time.time())}')
-    wandb_user_name = input.get('wandb_user_name', None)
-
+    use_wandb = input.get('wandb_logging', True)
     project = input.get('project_name', 'default_project')
     cfg = input.get('config', {})
 
-    run = wandb.init(
-        project=wandb_project_name,
-        entity=wandb_user_name,
-        config=cfg,
-        name=wandb_run_name,
-    )
+    run = None
+    run_link = None
+    run_id = None
+    if use_wandb:
+        os.environ['WANDB_API_KEY'] = input['W&B_API_KEY']
+        wandb.login()
+
+        wandb_project_name = input.get('wandb_project_name', 'default_wandb_project')
+        wandb_run_name = input.get('run_name', f'run_{int(time.time())}')
+        wandb_user_name = input.get('wandb_user_name', None)
+
+        run = wandb.init(
+            project=wandb_project_name,
+            entity=wandb_user_name,
+            config=cfg,
+            name=wandb_run_name,
+        )
+        run_link = f"https://wandb.ai/{wandb_user_name}/{wandb_project_name}/runs/{run.id}"
+        run_id = run.id
 
     try:
         project = __import__(f"projects.{project}", fromlist=['main'])
@@ -33,13 +39,12 @@ def handler(event):
         # probably local run
         project = __import__(f"container.projects.{project}", fromlist=['main'])
 
-    run_link = f"https://wandb.ai/{wandb_user_name}/{wandb_project_name}/runs/{run.id}"
-
     project.main(run, cfg)
 
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
 
-    return {"status": "completed", "run_id": run.id, "run_link": run_link}
+    return {"status": "completed", "run_id": run_id, "run_link": run_link}
 
 
 

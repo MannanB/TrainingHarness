@@ -3,6 +3,7 @@
         "W&B_API_KEY": "",
         "wandb_user_name": "",
         "wandb_project_name": "",
+        "wandb_logging": true,
         "run_name": "mnist_test_run_03",
         "project_name": "mnist",
         "config": {
