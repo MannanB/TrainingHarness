@@ -57,7 +57,7 @@ def build_chunked_dataset(cfg: MicroLMConfig, tokenizer) -> IterableDataset:
                 total = limit
 
             iterator = raw if limit is None else (row for idx, row in enumerate(raw) if idx < limit)
-            iterator = tqdm(iterator, total=total, desc="tokenize+pack", leave=False)
+            # iterator = tqdm(iterator, total=total, desc="tokenize+pack", leave=False)
 
             chunk_size = cfg.chunk_size
             eos_id = tokenizer.eos_token_id
@@ -169,6 +169,8 @@ def train(run: wandb.Run, cfg: MicroLMConfig):
     global_step = 0
     micro_step = 0
     pbar = tqdm(total=total_steps, desc="train", leave=False)
+    os.makedirs("./out", exist_ok=True)
+
     grad_norm = 0.0
     with torch.nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
                                           SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH]) if torch.cuda.is_available() else torch.enable_grad():
@@ -201,6 +203,15 @@ def train(run: wandb.Run, cfg: MicroLMConfig):
             loss.backward()
             micro_step += 1
 
+            if global_step % 50 == 0:
+                # Save model weights
+                model_path = os.path.join("./out", f"microlm-{global_step}.pt")
+                torch.save(model.state_dict(), model_path)
+                if run is not None:
+                    run.save(model_path, policy="now")
+
+
+
             if micro_step % cfg.grad_accum_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
                 optimizer.step()
@@ -231,7 +242,6 @@ def train(run: wandb.Run, cfg: MicroLMConfig):
 
     pbar.close()
 
-    os.makedirs("./out", exist_ok=True)
 
     # Save model weights
     model_path = os.path.join("./out", "microlm.pt")

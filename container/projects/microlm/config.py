@@ -16,8 +16,8 @@ class MicroLMConfig(BaseModel):
     chunk_size: int = 2048
     chunk_overlap: int = 128
     total_tokens: int = 100_000_000
-    batch_size: int = 32
-    grad_accum_steps: int = 4
+    batch_size: int = 8
+    grad_accum_steps: int = 16
 
     lr_max: float = 8e-4
     adam_beta1: float = 0.9

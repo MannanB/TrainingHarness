@@ -18,8 +18,8 @@
             "chunk_size": 2048,
             "chunk_overlap": 128,
             "total_tokens": 100000000,
-            "batch_size": 64,
-            "grad_accum_steps": 2,
+            "batch_size": 8,
+            "grad_accum_steps": 16,
 
             "lr_max": 0.0008,
             "adam_beta1": 0.9,
