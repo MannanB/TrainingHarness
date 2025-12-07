@@ -6,9 +6,9 @@ from torch.amp import GradScaler
 from datasets import load_dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset
 import torch.nn.functional as F
-from transformers import T5TokenizerFast, AutoTokenizer
+from transformers import T5TokenizerFast
 from tqdm import tqdm
 
 from .config import MicroLMConfig
@@ -45,75 +45,51 @@ def _finalize_chunk(buffer: List[int], chunk_size: int) -> Dict[str, torch.Tenso
     }
 
 
-def _pack_dataset_tokens(
-    raw_iter,
-    tokenizer,
-    chunk_size: int,
-    text_field: str,
-) -> List[Dict[str, torch.Tensor]]:
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive")
+def build_chunked_dataset(cfg: MicroLMConfig, tokenizer) -> IterableDataset:
+    limit = getattr(cfg, "test_samples_dataset", None)
 
-    eos_id = tokenizer.eos_token_id
-    if eos_id is None:
-        raise ValueError("Tokenizer must provide eos_token_id when no padding is used.")
+    class PackedIterableDataset(IterableDataset):
+        def __iter__(self_inner):
+            raw = load_raw_dataset(cfg)
+            try:
+                total = len(raw) if limit is None else min(len(raw), limit)
+            except TypeError:
+                total = limit
 
-    chunks: List[Dict[str, torch.Tensor]] = []
-    buffer: List[int] = []
+            iterator = raw if limit is None else (row for idx, row in enumerate(raw) if idx < limit)
+            iterator = tqdm(iterator, total=total, desc="tokenize+pack", leave=False)
 
-    for record in raw_iter:
-        text = record.get(text_field, "")
-        tokens: List[int] = tokenizer.encode(text, add_special_tokens=False)
-        if not tokens:
-            continue
-        tokens.append(eos_id)
+            chunk_size = cfg.chunk_size
+            eos_id = tokenizer.eos_token_id
+            if eos_id is None:
+                raise ValueError("Tokenizer must provide eos_token_id when no padding is used.")
 
-        idx = 0
-        while idx < len(tokens):
-            space = chunk_size - len(buffer)
-            take = min(space, len(tokens) - idx)
-            buffer.extend(tokens[idx : idx + take])
-            idx += take
-            if len(buffer) == chunk_size:
-                chunks.append(_finalize_chunk(buffer, chunk_size))
-                buffer = []
+            buffer: List[int] = []
+            for record in iterator:
+                text = record.get(cfg.dataset_field, "")
+                tokens: List[int] = tokenizer.encode(text, add_special_tokens=False)
+                if not tokens:
+                    continue
+                tokens.append(eos_id)
 
-    # drop incomplete tail to avoid padding entirely
+                idx = 0
+                while idx < len(tokens):
+                    space = chunk_size - len(buffer)
+                    take = min(space, len(tokens) - idx)
+                    buffer.extend(tokens[idx : idx + take])
+                    idx += take
+                    if len(buffer) == chunk_size:
+                        yield _finalize_chunk(buffer, chunk_size)
+                        buffer = []
+            # drop incomplete tail to avoid padding entirely
 
-    return chunks
-
-
-class ChunkedTextDataset(Dataset):
-    def __init__(self, samples: List[Dict[str, torch.Tensor]]):
-        self.samples = samples
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-def build_chunked_dataset(cfg: MicroLMConfig, tokenizer) -> ChunkedTextDataset:
-    raw = load_raw_dataset(cfg)
-    try:
-        total = len(raw)
-    except TypeError:
-        total = None
-
-    if cfg.test_samples_dataset is not None:
-        raw = raw.select(range(cfg.test_samples_dataset))
-        total = cfg.test_samples_dataset
-
-    iterator = tqdm(raw, total=total, desc="tokenize+pack", leave=False)
-    samples = _pack_dataset_tokens(iterator, tokenizer, chunk_size=cfg.chunk_size, text_field=cfg.dataset_field)
-    return ChunkedTextDataset(samples)
+    return PackedIterableDataset()
 
 
 def build_dataloader(
     cfg: MicroLMConfig,
     tokenizer,
-    shuffle: bool = True,
+    shuffle: bool = False,
     drop_last: bool = False,
     num_workers: int = 0,
 ) -> DataLoader:
@@ -170,7 +146,7 @@ def train(run: wandb.Run, cfg: MicroLMConfig):
         bos_token_id=tokenizer.bos_token_id or tokenizer.eos_token_id or tokenizer.pad_token_id,
     ).to(device).to(torch.float16 if use_fp16 else torch.float32)
 
-    dataloader = build_dataloader(cfg, tokenizer, shuffle=True)
+    dataloader = build_dataloader(cfg, tokenizer, shuffle=False)
 
     tokens_per_step = cfg.batch_size * cfg.chunk_size * cfg.grad_accum_steps
     print(f"Tokens per step: {tokens_per_step}")
@@ -248,7 +224,8 @@ def train(run: wandb.Run, cfg: MicroLMConfig):
                         step=global_step,
                     )
                 else:
-                    print(f"Step {global_step}: loss={true_loss:.4f}, lr={current_lr:.6e}, grad_norm={grad_norm:.4f}, tokens_seen={tokens_seen}")
+                    # print(f"Step {global_step}: loss={true_loss:.4f}, lr={current_lr:.6e}, grad_norm={grad_norm:.4f}, tokens_seen={tokens_seen}")
+                    pass
                 pbar.set_postfix(loss=true_loss, lr=current_lr)
                 pbar.update(1)
 
