@@ -6,8 +6,8 @@
         "wandb_logging": true,
         "run_name": "mnist_test_run_03",
         "project_name": "mnist", 
-        "github_url": "",
-        "github_entrypoint": "", 
+        "github_zip_url": "https://github.com/MannanB/TrainingHarness/archive/refs/heads/main.zip",
+        "github_entrypoint": "projects.mnist", 
         "config": {
             "num_epochs": 3
         }
