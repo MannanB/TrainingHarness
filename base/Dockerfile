@@ -4,7 +4,7 @@
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHON_VERSION=3.10
+ENV PYTHON_VERSION=3.12
 ENV PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:$PATH
 
 # System deps + Python 3.10 + pip
