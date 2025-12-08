@@ -4,15 +4,15 @@ import json
 import torch
 from transformers import T5TokenizerFast
 
-from .config import MicroLMConfig
+from .config import RefinerLMConfig
 from .model import load_model
 
 # python -m container.projects.microlm.test --config-path ./inputs/microlm-50m.json --weights-path ./microlm.pt --prompt "test prompt haha" --max-new-tokens 256
 
-def load_cfg(path: str) -> MicroLMConfig:
+def load_cfg(path: str) -> RefinerLMConfig:
     with open(path, "r") as f:
         data = json.load(f)
-    return MicroLMConfig(**data.get("input", data).get("config", data))
+    return RefinerLMConfig(**data.get("input", data).get("config", data))
 
 
 def prepare_tokenizer():
