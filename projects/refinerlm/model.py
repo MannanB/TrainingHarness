@@ -87,8 +87,7 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    # @check_model_inputs
-    @auto_docstring
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
