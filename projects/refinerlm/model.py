@@ -50,7 +50,7 @@ def load_model(
         attn_implementation="sdpa" # using torch.nn.attention sdpa_kernel to use flash attention (hopefully this works lol)
     )
     # config = Gemma3Config(text_config=text_config)
-    model = RefinerGemma3ForCausalLM(text_config)
+    model = RefinerGemma3ForCausalLM(text_config, n_recursions=microLMConfig.num_recursions, recursion_version=microLMConfig.get("recursion_version", 0))
 
     print(f"Model loaded with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
 
@@ -458,9 +458,11 @@ class RefinerGemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
     config: Gemma3TextConfig
     base_model_prefix = "language_model"
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, config: Gemma3TextConfig, n_recursions: int = 1, recursion_version: int = 0):
         super().__init__(config)
         self.model = RefinerGemma3TextModel(config)
+        self.n_recursions = n_recursions
+        self.recursion_version = recursion_version
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -528,6 +530,8 @@ class RefinerGemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
+            n_recursions=self.n_recursions,
+            recursion_version=self.recursion_version,
             **kwargs,
         )
 

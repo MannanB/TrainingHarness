@@ -14,6 +14,7 @@ class RefinerLMConfig(BaseModel):
     dropout_rate: float = 0.1
 
     num_recursions: int = 6
+    recursion_version: int = 1
 
     chunk_size: int = 2048
     chunk_overlap: int = 128
