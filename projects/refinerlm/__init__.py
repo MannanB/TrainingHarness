@@ -1,9 +1,9 @@
 
-from .config import MicroLMConfig
+from .config import RefinerLMConfig
 from .train import train
 
 def main(run, config):
 
-    cfg = MicroLMConfig(**config)
+    cfg = RefinerLMConfig(**config)
 
     train(run, cfg)

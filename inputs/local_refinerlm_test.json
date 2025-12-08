@@ -3,8 +3,8 @@
         "W&B_API_KEY": "",
         "wandb_user_name": "",
         "wandb_project_name": "",
-        "run_name": "local_microlm_test_run_01",
-        "project_name": "microlm",
+        "run_name": "local_refiner_test_run_01",
+        "project_name": "refinerlm",
         "wandb_logging": false,
         "config": {
             "hidden_size": 64,
