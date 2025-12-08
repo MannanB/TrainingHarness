@@ -50,7 +50,7 @@ def load_model(
         attn_implementation="sdpa" # using torch.nn.attention sdpa_kernel to use flash attention (hopefully this works lol)
     )
     # config = Gemma3Config(text_config=text_config)
-    model = RefinerGemma3ForCausalLM(text_config, n_recursions=microLMConfig.num_recursions, recursion_version=microLMConfig.get("recursion_version", 0))
+    model = RefinerGemma3ForCausalLM(text_config, n_recursions=microLMConfig.num_recursions, recursion_version=microLMConfig.recursion_version)
 
     print(f"Model loaded with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
 
@@ -198,7 +198,6 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
 
             # Interleave: [in0, out0, in1, out1, ...]
             interleaved_seq_len = seq_len * 2
-            # Start output tokens at zeros (or you can change this to learned bias / copy input, etc.)
             output_init = torch.zeros_like(hidden_states)
 
             interleaved_hidden = torch.empty(
@@ -208,12 +207,11 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            interleaved_hidden[:, 0::2, :] = hidden_states          # input tokens
-            interleaved_hidden[:, 1::2, :] = output_init            # output tokens
+            interleaved_hidden[:, 0::2, :] = hidden_states       # input tokens
+            interleaved_hidden[:, 1::2, :] = output_init         # output tokens
 
             # Build interleaved cache_position / position_ids
-            # Original cache_position is shape (seq_len,) with consecutive positions.
-            base_cache_position = cache_position  # (seq_len,)
+            base_cache_position = cache_position  # shape (seq_len,)
             interleaved_cache_position = torch.empty(
                 interleaved_seq_len,
                 dtype=base_cache_position.dtype,
@@ -223,78 +221,82 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
             interleaved_cache_position[1::2] = base_cache_position * 2 + 1
             interleaved_position_ids = interleaved_cache_position.unsqueeze(0).expand(batch_size, -1)
 
-            # Derive an interleaved 1D attention_mask from the original (if any)
-            if attention_mask is not None and not isinstance(attention_mask, dict):
-                if attention_mask.dim() != 2:
-                    raise ValueError(
-                        f"Expected `attention_mask` to be [batch, seq_len] but got shape {attention_mask.shape}"
-                    )
-                interleaved_attn_mask = attention_mask.repeat_interleave(2, dim=1)
+            # ---- Get base 4D masks on the ORIGINAL sequence length T ----
+            # We want base_full_mask, base_sliding_mask of shape [B, H, T, T].
+            if isinstance(attention_mask, dict):
+                base_full_mask = attention_mask["full_attention"]
+                base_sliding_mask = attention_mask["sliding_attention"]
+            elif attention_mask is not None and not isinstance(attention_mask, dict) and attention_mask.dim() == 4:
+                # You passed a "normal" 4D mask already: [B, H, T, T] or [B, 1, T, T]
+                base_full_mask = attention_mask
+                base_sliding_mask = attention_mask
             else:
-                interleaved_attn_mask = None
+                # Build from a "normal" token-level mask / None
+                base_mapping = build_causal_mask_mapping(
+                    input_embeds=hidden_states,
+                    token_attention_mask=attention_mask if (attention_mask is None or attention_mask.dim() == 2) else None,
+                    cache_pos=cache_position,
+                    pos_ids=position_ids,
+                    pkv=None,
+                )
+                base_full_mask = base_mapping["full_attention"]
+                base_sliding_mask = base_mapping["sliding_attention"]
 
-            # Start from a *normal* causal mask on the interleaved sequence
-            causal_mask_mapping = build_causal_mask_mapping(
-                input_embeds=interleaved_hidden,
-                token_attention_mask=interleaved_attn_mask,
-                cache_pos=interleaved_cache_position,
-                pos_ids=interleaved_position_ids,
-                pkv=None,
-            )
-
-            # Fancy mask: outputs attend only to inputs, inputs ignore outputs.
-            def make_interleaved_mask(base_mask: torch.Tensor) -> torch.Tensor:
-                # base_mask: [batch, 1 or num_heads, L, L]
+            def expand_interleaved_mask(base_mask: torch.Tensor) -> Optional[torch.Tensor]:
                 if base_mask is None:
                     return None
-                mask = base_mask.clone()
-                L_q = mask.size(-2)
-                L_k = mask.size(-1)
-                assert L_q == interleaved_seq_len and L_k == interleaved_seq_len, (
-                    f"Unexpected causal mask shape {mask.shape} for interleaved length {interleaved_seq_len}"
+                # base_mask: [B, H or 1, T, T]
+                B, H, Tq, Tk = base_mask.shape
+                assert Tq == seq_len and Tk == seq_len, (
+                    f"Base mask seq_len mismatch: got {base_mask.shape}, expected T={seq_len}"
                 )
 
-                # Query / key indices
-                q_idx = torch.arange(L_q, device=mask.device)
-                k_idx = torch.arange(L_k, device=mask.device)
+                L = seq_len * 2
+                # Use the most negative value as "forbidden"
+                forbidden_val = base_mask.min()
 
-                input_q = q_idx[0::2]
-                output_q = q_idx[1::2]
-                input_k = k_idx[0::2]
-                output_k = k_idx[1::2]
+                # Start with everything forbidden
+                out = torch.full(
+                    (B, H, L, L),
+                    forbidden_val,
+                    dtype=base_mask.dtype,
+                    device=base_mask.device,
+                )
 
-                # Use the most negative value in the mask as "forbidden"
-                forbidden_val = mask.min()
+                q_idx = torch.arange(seq_len, device=base_mask.device)
+                k_idx = torch.arange(seq_len, device=base_mask.device)
 
-                # 1) Inputs should never attend to outputs
-                #    mask[..., q = even, k = odd] = forbidden
-                mask[..., input_q.unsqueeze(-1), output_k] = forbidden_val
+                input_q = 2 * q_idx       # even positions
+                output_q = 2 * q_idx + 1  # odd positions
+                input_k = 2 * k_idx       # even positions
+                # output_k = 2 * k_idx + 1  # odd positions (kept forbidden)
 
-                # 2) Outputs should never attend to outputs
-                #    mask[..., q = odd, k = odd] = forbidden
-                mask[..., output_q.unsqueeze(-1), output_k] = forbidden_val
+                # 1) Inputs attend to inputs, copying original pattern
+                #    out[..., 2i, 2j] = base_mask[..., i, j]
+                out[..., input_q[:, None], input_k] = base_mask
 
-                # 3) Outputs may attend to inputs; the base causal mask already enforces
-                #    "only tokens before" (causality), so we don't need to change
-                #    mask[..., output_q, input_k].
-                return mask
+                # 2) Outputs attend to inputs, also copying original pattern
+                #    out[..., 2i+1, 2j] = base_mask[..., i, j]
+                out[..., output_q[:, None], input_k] = base_mask
+
+                # 3) Any key at odd positions stays at `forbidden_val` (no one attends to outputs),
+                #    which is already set by initialization.
+                return out
 
             interleaved_causal_mask_mapping = {
-                attn_type: make_interleaved_mask(mask)
-                for attn_type, mask in causal_mask_mapping.items()
+                "full_attention": expand_interleaved_mask(base_full_mask),
+                "sliding_attention": expand_interleaved_mask(base_sliding_mask),
             }
 
             # Position embeddings for interleaved sequence
             position_embeddings_global = self.rotary_emb(interleaved_hidden, interleaved_position_ids)
             position_embeddings_local = self.rotary_emb_local(interleaved_hidden, interleaved_position_ids)
 
-            # Decoder layers with recursion. We keep the input tokens "fresh" at each recursion.
+            # Decoder layers with recursion. Keep the input tokens "fresh" each recursion.
             all_hidden_states = () if output_hidden_states else None
             all_self_attns = () if output_attentions else None
 
-            # fixed copy of the *input* tokens (even positions)
             fixed_input_tokens = interleaved_hidden[:, 0::2, :].clone()
-
             hidden_states_interleaved = interleaved_hidden
 
             for r in range(n_recursions):
@@ -304,7 +306,7 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
 
                 for decoder_layer in self.layers[: self.config.num_hidden_layers]:
                     if output_hidden_states:
-                        # store only the "logical" sequence (input positions) for convenience
+                        # store only logical tokens (inputs) for convenience
                         all_hidden_states += (hidden_states_interleaved[:, 0::2, :],)
 
                     layer_outputs = decoder_layer(
@@ -332,7 +334,6 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (final_hidden_states,)
 
-            # No KV cache support for this mode
             return BaseModelOutputWithPast(
                 last_hidden_state=final_hidden_states,
                 past_key_values=None,

@@ -7,7 +7,7 @@ from transformers import T5TokenizerFast
 from .config import RefinerLMConfig
 from .model import load_model
 
-# python -m container.projects.microlm.test --config-path ./inputs/microlm-50m.json --weights-path ./microlm.pt --prompt "test prompt haha" --max-new-tokens 256
+# python -m projects.microlm.test --config-path ./inputs/microlm-50m.json --weights-path ./microlm.pt --prompt "test prompt haha" --max-new-tokens 256
 
 def load_cfg(path: str) -> RefinerLMConfig:
     with open(path, "r") as f:
