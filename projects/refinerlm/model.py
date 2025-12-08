@@ -1,15 +1,14 @@
 ﻿
-from transformers import Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig
+from transformers import Gemma3TextConfig
 from .config import RefinerLMConfig
-from typing import Optional, Dict, List, Unpack, Union
+from typing import Optional, Dict
 import torch
 import torch.nn as nn
 import copy
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils.logging import get_logger
+
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.utils import ModelOutput, TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import auto_docstring, can_return_tuple, logging
 from transformers.generation import GenerationMixin
 
 
@@ -104,7 +103,7 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         # NEW ARGS (optional, default keeps behavior identical)
         n_recursions: Optional[int] = None,
         recursion_version: int = 0,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> BaseModelOutputWithPast:
         """
         recursion_version:
@@ -490,7 +489,7 @@ class RefinerGemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        logits_to_keep  = 0,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
