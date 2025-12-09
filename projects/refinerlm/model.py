@@ -123,7 +123,6 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         # number of recursions – default 1
         if n_recursions is None or n_recursions < 1:
             n_recursions = 1
-
         # For non-standard paths, caching is messy; keep default behavior untouched when
         # user doesn't ask for recursion / fancy variants.
         if recursion_version == 2 or (n_recursions > 1 and recursion_version in (0, 1)):
@@ -194,10 +193,13 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
             hidden_states = inputs_embeds
             batch_size, seq_len, hidden_dim = hidden_states.shape
 
-            # Interleave: [in0, out0, in1, out1, ...]
-            interleaved_seq_len = seq_len * 2
-            output_init = torch.zeros_like(hidden_states)
+            # --- Base input & initial output streams ---
+            base_input = hidden_states                               # (B, T, D)
+            current_input = base_input.clone()
+            current_output = torch.zeros_like(base_input)            # (B, T, D)
 
+            # Interleaved: [in0, out0, in1, out1, ...] just for shape/pos/mask setup
+            interleaved_seq_len = seq_len * 2
             interleaved_hidden = torch.empty(
                 batch_size,
                 interleaved_seq_len,
@@ -205,10 +207,10 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            interleaved_hidden[:, 0::2, :] = hidden_states       # input tokens
-            interleaved_hidden[:, 1::2, :] = output_init         # output tokens
+            interleaved_hidden[:, 0::2, :] = current_input           # input tokens
+            interleaved_hidden[:, 1::2, :] = current_output          # output tokens
 
-            # Build interleaved cache_position / position_ids
+            # Build interleaved cache_position / position_ids (positions stay fixed across recursions)
             base_cache_position = cache_position  # shape (seq_len,)
             interleaved_cache_position = torch.empty(
                 interleaved_seq_len,
@@ -269,16 +271,15 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
                 input_k = 2 * k_idx       # even positions
                 # output_k = 2 * k_idx + 1  # odd positions (kept forbidden)
 
-                # 1) Inputs attend to inputs, copying original pattern
+                # 1) Inputs attend to inputs: copy original pattern
                 #    out[..., 2i, 2j] = base_mask[..., i, j]
                 out[..., input_q[:, None], input_k] = base_mask
 
-                # 2) Outputs attend to inputs, also copying original pattern
+                # 2) Outputs attend to inputs: also copy original pattern
                 #    out[..., 2i+1, 2j] = base_mask[..., i, j]
                 out[..., output_q[:, None], input_k] = base_mask
 
-                # 3) Any key at odd positions stays at `forbidden_val` (no one attends to outputs),
-                #    which is already set by initialization.
+                # 3) Any key at odd positions stays at `forbidden_val` (no one attends to outputs).
                 return out
 
             interleaved_causal_mask_mapping = {
@@ -286,21 +287,21 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
                 "sliding_attention": expand_interleaved_mask(base_sliding_mask),
             }
 
-            # Position embeddings for interleaved sequence
+            # Position embeddings for interleaved sequence (content-independent; shape matters)
             position_embeddings_global = self.rotary_emb(interleaved_hidden, interleaved_position_ids)
             position_embeddings_local = self.rotary_emb_local(interleaved_hidden, interleaved_position_ids)
 
-            # Decoder layers with recursion. Keep the input tokens "fresh" each recursion.
+            # Decoder layers with recursion. Now outputs feed back into inputs between recursions.
             all_hidden_states = () if output_hidden_states else None
             all_self_attns = () if output_attentions else None
 
-            fixed_input_tokens = interleaved_hidden[:, 0::2, :].clone()
-            hidden_states_interleaved = interleaved_hidden
+            last_interleaved = interleaved_hidden  # just for initialization
 
             for r in range(n_recursions):
-                # refresh input tokens to original embeddings at each recursion
-                hidden_states_interleaved = hidden_states_interleaved.clone()
-                hidden_states_interleaved[:, 0::2, :] = fixed_input_tokens
+                # Rebuild interleaved from current_input and current_output
+                hidden_states_interleaved = torch.empty_like(last_interleaved)
+                hidden_states_interleaved[:, 0::2, :] = current_input
+                hidden_states_interleaved[:, 1::2, :] = current_output
 
                 for decoder_layer in self.layers[: self.config.num_hidden_layers]:
                     if output_hidden_states:
@@ -325,9 +326,22 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
                     if output_attentions:
                         all_self_attns += (layer_outputs[1],)
 
-            # Final norm, then take ONLY the output tokens (odd positions)
-            hidden_states_interleaved = self.norm(hidden_states_interleaved)
-            final_hidden_states = hidden_states_interleaved[:, 1::2, :]  # (B, T, D)
+                # After one full stack pass:
+                # - discard input token modifications
+                # - keep output token modifications
+                new_output = hidden_states_interleaved[:, 1::2, :]        # (B, T, D)
+
+                # FEEDBACK: update inputs for next recursion.
+                # Simple "readd to initial input tokens" = base_input + new_output.
+                # If you want cumulative refinement: current_input = base_input + cumulative_output.
+                current_output = new_output
+                current_input = base_input + new_output
+
+                last_interleaved = hidden_states_interleaved
+
+            # Final norm on last interleaved, then take ONLY the output tokens (odd positions)
+            last_interleaved = self.norm(last_interleaved)
+            final_hidden_states = last_interleaved[:, 1::2, :]  # (B, T, D)
 
             if output_hidden_states:
                 all_hidden_states += (final_hidden_states,)

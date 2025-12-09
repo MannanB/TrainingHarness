@@ -3,5 +3,6 @@ __pycache__
 artifacts
 wandb
 runpodctl.exe
+venv
 
 *.pt
