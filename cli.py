@@ -20,6 +20,7 @@ IMAGE_CONTAINER = f"{DOCKER_USER}/{REPO_NAME_CONTAINER}:latest"
 
 ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID")
 
+os.environ["TRAINING_HARNESS_LOCAL_RUN"] = "1" # Indicate local run to the handler, if it is indeed a local run
 
 class Colors:
     HEADER = '\033[95m'

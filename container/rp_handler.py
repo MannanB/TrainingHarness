@@ -153,23 +153,30 @@ def handler(event):
         run_id = run.id
 
     # --- SYNC CODE FROM GITHUB ---
-    root_path, root_dir_name = sync_code(zip_url)
-
-    # --- IMPORT PROJECT / ENTRYPOINT MODULE ---
-    if zip_url == DEFAULT_ZIP_URL:
-        # Case (a): TrainingHarness default
-        #   Use TrainingHarness/projects/<project_name>.py
-        #   and import `projects.<project_name>` like before.
+    if os.environ.get("TRAINING_HARNESS_LOCAL_RUN") == "1":
+        # Local run: use local code
+        root_path = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+        root_dir_name = os.path.basename(root_path)
+        print(f"[bootstrap] Local run detected. Using local code at {root_path}")
         project_module = _import_module_from_trainingharness(root_path, project_name)
     else:
-        # Case (b): Custom GitHub zip
-        #   If ghentry is None/blank:
-        #       find [repo] = top-level package under root, import [repo]
-        #   Else:
-        #       import [repo].[ghentry] where ghentry is a full module path
-        #       relative to repo root (e.g. "mypkg.entrypoint")
-        ghentry_clean = ghentry.strip() if isinstance(ghentry, str) else None
-        project_module = _import_module_from_generic_repo(root_path, ghentry_clean)
+        root_path, root_dir_name = sync_code(zip_url)
+
+        # --- IMPORT PROJECT / ENTRYPOINT MODULE ---
+        if zip_url == DEFAULT_ZIP_URL:
+            # Case (a): TrainingHarness default
+            #   Use TrainingHarness/projects/<project_name>.py
+            #   and import `projects.<project_name>` like before.
+            project_module = _import_module_from_trainingharness(root_path, project_name)
+        else:
+            # Case (b): Custom GitHub zip
+            #   If ghentry is None/blank:
+            #       find [repo] = top-level package under root, import [repo]
+            #   Else:
+            #       import [repo].[ghentry] where ghentry is a full module path
+            #       relative to repo root (e.g. "mypkg.entrypoint")
+            ghentry_clean = ghentry.strip() if isinstance(ghentry, str) else None
+            project_module = _import_module_from_generic_repo(root_path, ghentry_clean)
 
     project_module.main(run, cfg)
 

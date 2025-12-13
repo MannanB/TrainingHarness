@@ -386,7 +386,7 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
 
         # Interleave: [in0, out0, in1, out1, ...]
         interleaved_seq_len = seq_len * 2
-        start = self.start_embed.view(1, 1, hidden_dim).expand(batch_size, -1, -1)
+        start = self.start_embed.view(1, 1, hidden_dim).expand(batch_size, seq_len, hidden_dim)
         stacked = torch.stack((hidden_states, start), dim=2)
         interleaved_hidden = stacked.view(batch_size, interleaved_seq_len, hidden_dim) # cool trick to interleave
 
