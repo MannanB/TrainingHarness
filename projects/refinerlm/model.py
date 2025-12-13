@@ -245,6 +245,9 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
         self.start_embed = nn.Parameter(torch.empty(config.hidden_size))
         nn.init.normal_(self.start_embed, mean=0.0, std=1.0 / math.sqrt(config.hidden_size))
 
+        self.rec_gate = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        nn.init.zeros_(self.rec_gate.weight)
+        nn.init.constant_(self.rec_gate.bias, -2.0)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -439,6 +442,8 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
             hidden_states_interleaved = hidden_states_interleaved.clone()
             hidden_states_interleaved[:, 0::2, :] = fixed_input_tokens
 
+            prev_hidden_outs = hidden_states_interleaved[:, 1::2, :]  # previous outputs
+
             for decoder_layer in self.layers[: self.config.num_hidden_layers]:
                 if output_hidden_states:
                     # store only logical tokens (inputs) for convenience
@@ -461,6 +466,15 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
 
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
+
+            # After all layers, apply recurrence gate to update only output tokens
+            post_layer_outputs = hidden_states_interleaved[:, 1::2, :]  # current outputs
+            g = torch.sigmoid(self.rec_gate(post_layer_outputs))  # (B, T, D)
+            # map g to [0.05, 0.95] to avoid complete overwriting or complete skipping
+            g = g * 0.9 + 0.05
+            blended_out = g * post_layer_outputs + (1.0 - g) * prev_hidden_outs
+            hidden_states_interleaved[:, 1::2, :] = blended_out
+
 
         # Final norm, then take ONLY the output tokens (odd positions)
         hidden_states_interleaved = self.norm(hidden_states_interleaved)

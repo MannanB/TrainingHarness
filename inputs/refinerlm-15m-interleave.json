@@ -18,13 +18,13 @@
             "num_recursions": 6,
             "recursion_version": 1,
 
-            "chunk_size": 2048,
+            "chunk_size": 1024,
             "chunk_overlap": 128,
             "total_tokens": 100000000,
-            "batch_size": 3,
-            "grad_accum_steps": 43,
+            "batch_size": 2,
+            "grad_accum_steps": 64,
 
-            "lr_max": 0.002,
+            "lr_max": 0.0005,
             "adam_beta1": 0.9,
             "adam_beta2": 0.95,
             "adam_eps": 1e-8,
