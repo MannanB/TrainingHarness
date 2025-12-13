@@ -16,7 +16,7 @@
             "dropout_rate": 0.05,
 
             "num_recursions": 6,
-            "recursion_version": 1,
+            "recursion_version": 0,
 
             "chunk_size": 2048,
             "chunk_overlap": 128,

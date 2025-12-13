@@ -4,7 +4,7 @@ from .config import RefinerLMConfig
 from typing import Optional, Dict
 import torch
 import torch.nn as nn
-import copy
+import copy, math
 
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
@@ -58,7 +58,165 @@ def load_model(
 
 
 @auto_docstring
-class RefinerGemma3TextModel(Gemma3PreTrainedModel):
+class RefinerRecursiveGemma3TextModel(Gemma3PreTrainedModel):
+    config: Gemma3TextConfig
+
+    def __init__(self, config: Gemma3TextConfig):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = Gemma3TextScaledWordEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            embed_scale=self.config.hidden_size**0.5,
+        )
+
+        self.layers = nn.ModuleList(
+            [Gemma3DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+
+        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Gemma3RotaryEmbedding(config=config)
+
+        cfg_local = copy.deepcopy(config)
+        cfg_local.rope_theta = cfg_local.rope_local_base_freq
+        cfg_local.rope_scaling = {"rope_type": "default"}
+        self.rotary_emb_local = Gemma3RotaryEmbedding(config=cfg_local)
+
+        self.gradient_checkpointing = False
+        self.post_init()
+
+    def _build_causal_mask_mapping(
+        self,
+        input_embeds: torch.FloatTensor,
+        token_attention_mask: Optional[torch.Tensor],
+        cache_pos: torch.LongTensor,
+        pos_ids: torch.LongTensor,
+        pkv: Optional[Cache],
+    ) -> Dict[str, torch.Tensor]:
+        if isinstance(token_attention_mask, dict):
+            return token_attention_mask
+
+        kwargs = dict(
+            config=self.config,
+            input_embeds=input_embeds,
+            attention_mask=token_attention_mask,
+            cache_position=cache_pos,
+            past_key_values=pkv,
+            position_ids=pos_ids,
+        )
+        return {
+            "full_attention": create_causal_mask(**kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**kwargs),
+        }
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        n_recursions: Optional[int] = None,
+        residual_across_recursions: bool = True,
+        **kwargs,
+    ) -> BaseModelOutputWithPast:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if n_recursions is None or n_recursions < 1:
+            n_recursions = 1
+
+        # recursive passes are not KV-cache compatible
+        if n_recursions > 1 and use_cache:
+            logger.warning_once("`use_cache=True` is incompatible with recursive refinement. Disabling cache.")
+            use_cache = False
+            past_key_values = None
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None and not self.training:
+            past_key_values = DynamicCache()
+
+        if cache_position is None:
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen,
+                past_seen + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask_mapping = self._build_causal_mask_mapping(
+            inputs_embeds, attention_mask, cache_position, position_ids, past_key_values
+        )
+
+        hidden_states = inputs_embeds
+        pos_emb_global = self.rotary_emb(hidden_states, position_ids)
+        pos_emb_local = self.rotary_emb_local(hidden_states, position_ids)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_attns = () if output_attentions else None
+
+        for _ in range(n_recursions):
+            residual = hidden_states if residual_across_recursions else None
+
+            for layer in self.layers:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                out = layer(
+                    hidden_states,
+                    position_embeddings_global=pos_emb_global,
+                    position_embeddings_local=pos_emb_local,
+                    attention_mask=causal_mask_mapping[layer.attention_type],
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+
+                hidden_states = out[0]
+
+                if output_attentions:
+                    all_attns += (out[1],)
+
+            if residual is not None:
+                hidden_states = hidden_states + residual
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=all_hidden_states,
+            attentions=all_attns,
+        )
+
+
+@auto_docstring
+class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
     config: Gemma3TextConfig
 
     def __init__(self, config: Gemma3TextConfig):
@@ -79,14 +237,87 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
 
         # TODO: raushan fix this after RoPE refactor. For now we hack it by reassigning thetas
         # when we want to create a local RoPE layer. Config defaults should hold values for global RoPE
-        config = copy.deepcopy(config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
+        cfg_local = copy.deepcopy(config)
+        cfg_local.rope_theta = cfg_local.rope_local_base_freq
+        cfg_local.rope_scaling = {"rope_type": "default"}
+        self.rotary_emb_local = Gemma3RotaryEmbedding(config=cfg_local)
+
+        self.start_embed = nn.Parameter(torch.empty(config.hidden_size))
+        nn.init.normal_(self.start_embed, mean=0.0, std=1.0 / math.sqrt(config.hidden_size))
+
 
         # Initialize weights and apply final processing
         self.post_init()
 
+    # ------------------------------
+    # Helper: build causal mask mapping from "normal" inputs
+    # ------------------------------
+    def _build_causal_mask_mapping(
+        self,
+        input_embeds: torch.FloatTensor,
+        token_attention_mask: Optional[torch.Tensor],
+        cache_pos: torch.LongTensor,
+        pos_ids: torch.LongTensor,
+        pkv: Optional[Cache],
+    ) -> Dict[str, torch.Tensor]:
+        if isinstance(token_attention_mask, dict):
+            # Already prepared by generate / external caller
+            return token_attention_mask  # type: ignore
+
+        mask_kwargs = {
+            "config": self.config,
+            "input_embeds": input_embeds,
+            "attention_mask": token_attention_mask,
+            "cache_position": cache_pos,
+            "past_key_values": pkv,
+            "position_ids": pos_ids,
+        }
+        return {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        }
+
+    def _expand_interleaved_mask(
+        self,
+        base_mask: Optional[torch.Tensor],
+        seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        if base_mask is None:
+            return None
+
+        # base_mask: [B, H or 1, T, T]
+        B, H, Tq, Tk = base_mask.shape
+        if Tq != seq_len or Tk != seq_len:
+            raise ValueError(f"Base mask seq_len mismatch: got {base_mask.shape}, expected T={seq_len}")
+
+        L = seq_len * 2
+        forbidden_val = base_mask.min()
+
+        # Start with everything forbidden
+        out = torch.full(
+            (B, H, L, L),
+            forbidden_val,
+            dtype=base_mask.dtype,
+            device=base_mask.device,
+        )
+
+        q_idx = torch.arange(seq_len, device=base_mask.device)
+        k_idx = torch.arange(seq_len, device=base_mask.device)
+
+        input_q = 2 * q_idx       # even positions
+        output_q = 2 * q_idx + 1  # odd positions
+        input_k = 2 * k_idx       # even positions
+        # output_k = 2 * k_idx + 1  # odd positions (kept forbidden)
+
+        # 1) Inputs attend to inputs, copying original pattern
+        out[..., input_q[:, None], input_k] = base_mask
+
+        # 2) Outputs attend to inputs, also copying original pattern
+        out[..., output_q[:, None], input_k] = base_mask
+
+
+        # 3) Keys at odd positions remain forbidden (already)
+        return out
 
     def forward(
         self,
@@ -99,21 +330,16 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        # NEW ARGS (optional, default keeps behavior identical)
+        # NEW ARGS
         n_recursions: Optional[int] = None,
-        recursion_version: int = 0,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         """
-        recursion_version:
-            0 -> no special cross-recursion residual (just repeat the stack n_recursions times)
-            1 -> simple residual between recursions (add output of each recursion to its input)
-            2 -> interleaved input/output refiner (odd positions are outputs; we return only them)
+        Interleaved input/output refiner:
+            [in0, out0, in1, out1, ...]
+        We return ONLY the output tokens (odd positions).
         """
 
-        # ------------------------------
-        # defaults / basic sanity
-        # ------------------------------
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -123,17 +349,14 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         # number of recursions – default 1
         if n_recursions is None or n_recursions < 1:
             n_recursions = 1
-        # For non-standard paths, caching is messy; keep default behavior untouched when
-        # user doesn't ask for recursion / fancy variants.
-        if recursion_version == 2 or (n_recursions > 1 and recursion_version in (0, 1)):
-            # Disable cache for multi-pass / interleaved mode – this is meant for training,
-            # not for incremental autoregressive decoding with KV cache.
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with recursive/interleaved refinement. Setting `use_cache=False`."
-                )
-            use_cache = False
-            past_key_values = None
+
+        # interleaved refinement is not KV-cache friendly
+        if use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with interleaved refinement. Setting `use_cache=False`."
+            )
+        use_cache = False
+        past_key_values = None
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -147,11 +370,8 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None and not self.training:
-            past_key_values = DynamicCache()
-
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            past_seen_tokens = 0
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
@@ -161,307 +381,100 @@ class RefinerGemma3TextModel(Gemma3PreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # ------------------------------
-        # Helper: build causal mask mapping from "normal" inputs
-        # ------------------------------
-        def build_causal_mask_mapping(
-            input_embeds: torch.FloatTensor,
-            token_attention_mask: Optional[torch.Tensor],
-            cache_pos: torch.LongTensor,
-            pos_ids: torch.LongTensor,
-            pkv: Optional[Cache],
-        ) -> Dict[str, torch.Tensor]:
-            if isinstance(token_attention_mask, dict):
-                # Already prepared by generate / external caller
-                return token_attention_mask  # type: ignore
-
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": input_embeds,
-                "attention_mask": token_attention_mask,
-                "cache_position": cache_pos,
-                "past_key_values": pkv,
-                "position_ids": pos_ids,
-            }
-            return {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
-
-
-        if recursion_version == 2:
-            hidden_states = inputs_embeds
-            batch_size, seq_len, hidden_dim = hidden_states.shape
-
-            # --- Base input & initial output streams ---
-            base_input = hidden_states                               # (B, T, D)
-            current_input = base_input.clone()
-            current_output = torch.zeros_like(base_input)            # (B, T, D)
-
-            # Interleaved: [in0, out0, in1, out1, ...] just for shape/pos/mask setup
-            interleaved_seq_len = seq_len * 2
-            interleaved_hidden = torch.empty(
-                batch_size,
-                interleaved_seq_len,
-                hidden_dim,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            interleaved_hidden[:, 0::2, :] = current_input           # input tokens
-            interleaved_hidden[:, 1::2, :] = current_output          # output tokens
-
-            # Build interleaved cache_position / position_ids (positions stay fixed across recursions)
-            base_cache_position = cache_position  # shape (seq_len,)
-            interleaved_cache_position = torch.empty(
-                interleaved_seq_len,
-                dtype=base_cache_position.dtype,
-                device=base_cache_position.device,
-            )
-            interleaved_cache_position[0::2] = base_cache_position * 2
-            interleaved_cache_position[1::2] = base_cache_position * 2 + 1
-            interleaved_position_ids = interleaved_cache_position.unsqueeze(0).expand(batch_size, -1)
-
-            # ---- Get base 4D masks on the ORIGINAL sequence length T ----
-            # We want base_full_mask, base_sliding_mask of shape [B, H, T, T].
-            if isinstance(attention_mask, dict):
-                base_full_mask = attention_mask["full_attention"]
-                base_sliding_mask = attention_mask["sliding_attention"]
-            elif attention_mask is not None and not isinstance(attention_mask, dict) and attention_mask.dim() == 4:
-                # You passed a "normal" 4D mask already: [B, H, T, T] or [B, 1, T, T]
-                base_full_mask = attention_mask
-                base_sliding_mask = attention_mask
-            else:
-                # Build from a "normal" token-level mask / None
-                base_mapping = build_causal_mask_mapping(
-                    input_embeds=hidden_states,
-                    token_attention_mask=attention_mask if (attention_mask is None or attention_mask.dim() == 2) else None,
-                    cache_pos=cache_position,
-                    pos_ids=position_ids,
-                    pkv=None,
-                )
-                base_full_mask = base_mapping["full_attention"]
-                base_sliding_mask = base_mapping["sliding_attention"]
-
-            def expand_interleaved_mask(base_mask: torch.Tensor) -> Optional[torch.Tensor]:
-                if base_mask is None:
-                    return None
-                # base_mask: [B, H or 1, T, T]
-                B, H, Tq, Tk = base_mask.shape
-                assert Tq == seq_len and Tk == seq_len, (
-                    f"Base mask seq_len mismatch: got {base_mask.shape}, expected T={seq_len}"
-                )
-
-                L = seq_len * 2
-                # Use the most negative value as "forbidden"
-                forbidden_val = base_mask.min()
-
-                # Start with everything forbidden
-                out = torch.full(
-                    (B, H, L, L),
-                    forbidden_val,
-                    dtype=base_mask.dtype,
-                    device=base_mask.device,
-                )
-
-                q_idx = torch.arange(seq_len, device=base_mask.device)
-                k_idx = torch.arange(seq_len, device=base_mask.device)
-
-                input_q = 2 * q_idx       # even positions
-                output_q = 2 * q_idx + 1  # odd positions
-                input_k = 2 * k_idx       # even positions
-                # output_k = 2 * k_idx + 1  # odd positions (kept forbidden)
-
-                # 1) Inputs attend to inputs: copy original pattern
-                #    out[..., 2i, 2j] = base_mask[..., i, j]
-                out[..., input_q[:, None], input_k] = base_mask
-
-                # 2) Outputs attend to inputs: also copy original pattern
-                #    out[..., 2i+1, 2j] = base_mask[..., i, j]
-                out[..., output_q[:, None], input_k] = base_mask
-
-                # 3) Any key at odd positions stays at `forbidden_val` (no one attends to outputs).
-                return out
-
-            interleaved_causal_mask_mapping = {
-                "full_attention": expand_interleaved_mask(base_full_mask),
-                "sliding_attention": expand_interleaved_mask(base_sliding_mask),
-            }
-
-            # Position embeddings for interleaved sequence (content-independent; shape matters)
-            position_embeddings_global = self.rotary_emb(interleaved_hidden, interleaved_position_ids)
-            position_embeddings_local = self.rotary_emb_local(interleaved_hidden, interleaved_position_ids)
-
-            # Decoder layers with recursion. Now outputs feed back into inputs between recursions.
-            all_hidden_states = () if output_hidden_states else None
-            all_self_attns = () if output_attentions else None
-
-            last_interleaved = interleaved_hidden  # just for initialization
-
-            for r in range(n_recursions):
-                # Rebuild interleaved from current_input and current_output
-                hidden_states_interleaved = torch.empty_like(last_interleaved)
-                hidden_states_interleaved[:, 0::2, :] = current_input
-                hidden_states_interleaved[:, 1::2, :] = current_output
-
-                for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-                    if output_hidden_states:
-                        # store only logical tokens (inputs) for convenience
-                        all_hidden_states += (hidden_states_interleaved[:, 0::2, :],)
-
-                    layer_outputs = decoder_layer(
-                        hidden_states_interleaved,
-                        position_embeddings_global=position_embeddings_global,
-                        position_embeddings_local=position_embeddings_local,
-                        attention_mask=interleaved_causal_mask_mapping[decoder_layer.attention_type],
-                        position_ids=interleaved_position_ids,
-                        past_key_value=None,
-                        output_attentions=output_attentions,
-                        use_cache=False,
-                        cache_position=interleaved_cache_position,
-                        **kwargs,
-                    )
-
-                    hidden_states_interleaved = layer_outputs[0]
-
-                    if output_attentions:
-                        all_self_attns += (layer_outputs[1],)
-
-                # After one full stack pass:
-                # - discard input token modifications
-                # - keep output token modifications
-                new_output = hidden_states_interleaved[:, 1::2, :]        # (B, T, D)
-
-                # FEEDBACK: update inputs for next recursion.
-                # Simple "readd to initial input tokens" = base_input + new_output.
-                # If you want cumulative refinement: current_input = base_input + cumulative_output.
-                current_output = new_output
-                current_input = base_input + new_output
-
-                last_interleaved = hidden_states_interleaved
-
-            # Final norm on last interleaved, then take ONLY the output tokens (odd positions)
-            last_interleaved = self.norm(last_interleaved)
-            final_hidden_states = last_interleaved[:, 1::2, :]  # (B, T, D)
-
-            if output_hidden_states:
-                all_hidden_states += (final_hidden_states,)
-
-            return BaseModelOutputWithPast(
-                last_hidden_state=final_hidden_states,
-                past_key_values=None,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attns,
-            )
-
-
-        # First build the usual causal masks on the original sequence
-        causal_mask_mapping = build_causal_mask_mapping(
-            input_embeds=inputs_embeds,
-            token_attention_mask=attention_mask,
-            cache_pos=cache_position,
-            pos_ids=position_ids,
-            pkv=past_key_values,
-        )
-
-        # embed positions
         hidden_states = inputs_embeds
+        batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
+        # Interleave: [in0, out0, in1, out1, ...]
+        interleaved_seq_len = seq_len * 2
+        start = self.start_embed.view(1, 1, hidden_dim).expand(batch_size, -1, -1)
+        stacked = torch.stack((hidden_states, start), dim=2)
+        interleaved_hidden = stacked.view(batch_size, interleaved_seq_len, hidden_dim) # cool trick to interleave
 
-        # decoder layers
+        # Build interleaved cache_position / position_ids
+        base_cache_position = cache_position  # (T,)
+        interleaved_cache_position = torch.empty(
+            interleaved_seq_len,
+            dtype=base_cache_position.dtype,
+            device=base_cache_position.device,
+        )
+        interleaved_cache_position[0::2] = base_cache_position * 2
+        interleaved_cache_position[1::2] = base_cache_position * 2 + 1
+        interleaved_position_ids = interleaved_cache_position.unsqueeze(0).expand(batch_size, -1)
+
+        # ---- Get base 4D masks on the ORIGINAL sequence length T ----
+        if isinstance(attention_mask, dict):
+            base_full_mask = attention_mask["full_attention"]
+            base_sliding_mask = attention_mask["sliding_attention"]
+        elif attention_mask is not None and not isinstance(attention_mask, dict) and attention_mask.dim() == 4:
+            base_full_mask = attention_mask
+            base_sliding_mask = attention_mask
+        else:
+            base_mapping = self._build_causal_mask_mapping(
+                input_embeds=hidden_states,
+                token_attention_mask=attention_mask if (attention_mask is None or attention_mask.dim() == 2) else None,
+                cache_pos=cache_position,
+                pos_ids=position_ids,
+                pkv=None,
+            )
+            base_full_mask = base_mapping["full_attention"]
+            base_sliding_mask = base_mapping["sliding_attention"]
+
+        interleaved_causal_mask_mapping = {
+            "full_attention": self._expand_interleaved_mask(base_full_mask, seq_len=seq_len),
+            "sliding_attention": self._expand_interleaved_mask(base_sliding_mask, seq_len=seq_len),
+        }
+
+        # Position embeddings for interleaved sequence
+        position_embeddings_global = self.rotary_emb(interleaved_hidden, interleaved_position_ids)
+        position_embeddings_local = self.rotary_emb_local(interleaved_hidden, interleaved_position_ids)
+
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        num_layers = self.config.num_hidden_layers
-        layers = self.layers[:num_layers]
-
-
-        if n_recursions == 1 and recursion_version == 0:
-            # EXACT ORIGINAL BEHAVIOR
-            for decoder_layer in layers:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    position_embeddings_global=position_embeddings_global,
-                    position_embeddings_local=position_embeddings_local,
-                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    **kwargs,
-                )
-
-                hidden_states = layer_outputs[0]
-
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-
-            hidden_states = self.norm(hidden_states)
-
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=past_key_values,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attns,
-            )
-
-        # Recursive variants on the original (non-interleaved) sequence
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+        fixed_input_tokens = interleaved_hidden[:, 0::2, :].clone()
+        hidden_states_interleaved = interleaved_hidden
 
         for r in range(n_recursions):
-            if recursion_version == 1:
-                # simple residual between recursions
-                residual_rec_in = hidden_states
-            else:
-                residual_rec_in = None
+            # refresh input tokens to original embeddings at each recursion
+            hidden_states_interleaved = hidden_states_interleaved.clone()
+            hidden_states_interleaved[:, 0::2, :] = fixed_input_tokens
 
-            for decoder_layer in layers:
+            for decoder_layer in self.layers[: self.config.num_hidden_layers]:
                 if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
+                    # store only logical tokens (inputs) for convenience
+                    all_hidden_states += (hidden_states_interleaved[:, 0::2, :],)
 
                 layer_outputs = decoder_layer(
-                    hidden_states,
+                    hidden_states_interleaved,
                     position_embeddings_global=position_embeddings_global,
                     position_embeddings_local=position_embeddings_local,
-                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    attention_mask=interleaved_causal_mask_mapping[decoder_layer.attention_type],
+                    position_ids=interleaved_position_ids,
+                    past_key_value=None,
                     output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
+                    use_cache=False,
+                    cache_position=interleaved_cache_position,
                     **kwargs,
                 )
 
-                hidden_states = layer_outputs[0]
+                hidden_states_interleaved = layer_outputs[0]
 
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
 
-            if recursion_version == 1 and residual_rec_in is not None:
-                hidden_states = hidden_states + residual_rec_in
-
-        hidden_states = self.norm(hidden_states)
+        # Final norm, then take ONLY the output tokens (odd positions)
+        hidden_states_interleaved = self.norm(hidden_states_interleaved)
+        final_hidden_states = hidden_states_interleaved[:, 1::2, :]  # (B, T, D)
 
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states += (final_hidden_states,)
 
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+            last_hidden_state=final_hidden_states,
+            past_key_values=None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
 
 @auto_docstring
 class RefinerGemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
@@ -473,7 +486,10 @@ class RefinerGemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
 
     def __init__(self, config: Gemma3TextConfig, n_recursions: int = 1, recursion_version: int = 0):
         super().__init__(config)
-        self.model = RefinerGemma3TextModel(config)
+        if recursion_version == 0:
+            self.model = RefinerRecursiveGemma3TextModel(config)
+        elif recursion_version == 1:
+            self.model = RefinerInterleaveGemma3TextModel(config)
         self.n_recursions = n_recursions
         self.recursion_version = recursion_version
         self.vocab_size = config.vocab_size
@@ -544,7 +560,6 @@ class RefinerGemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
             n_recursions=self.n_recursions,
-            recursion_version=self.recursion_version,
             **kwargs,
         )
 
