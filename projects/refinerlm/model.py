@@ -438,15 +438,17 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
         hidden_states_interleaved = interleaved_hidden
 
         for r in range(n_recursions):
-            # refresh input tokens to original embeddings at each recursion
+            # refresh input tokens
             hidden_states_interleaved = hidden_states_interleaved.clone()
             hidden_states_interleaved[:, 0::2, :] = fixed_input_tokens
 
-            prev_hidden_outs = hidden_states_interleaved[:, 1::2, :]  # previous outputs
+            # IMPORTANT: snapshot previous outputs (avoid view into same storage)
+            prev_hidden_outs = hidden_states_interleaved[:, 1::2, :].clone()
+            # If you prefer no gradient through the skip path:
+            # prev_hidden_outs = prev_hidden_outs.detach()
 
             for decoder_layer in self.layers[: self.config.num_hidden_layers]:
                 if output_hidden_states:
-                    # store only logical tokens (inputs) for convenience
                     all_hidden_states += (hidden_states_interleaved[:, 0::2, :],)
 
                 layer_outputs = decoder_layer(
@@ -467,12 +469,15 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
 
-            # After all layers, apply recurrence gate to update only output tokens
-            post_layer_outputs = hidden_states_interleaved[:, 1::2, :]  # current outputs
-            g = torch.sigmoid(self.rec_gate(post_layer_outputs))  # (B, T, D)
-            # map g to [0.05, 0.95] to avoid complete overwriting or complete skipping
-            g = g * 0.9 + 0.05
+            # Compute gated blend (avoid in-place on a tensor needed for backward)
+            post_layer_outputs = hidden_states_interleaved[:, 1::2, :]  # view is OK for reading
+            g = torch.sigmoid(self.rec_gate(post_layer_outputs))        # (B, T, D)
+            g = g * 0.9 + 0.05                                         # keep within [0.05, 0.95]
+
             blended_out = g * post_layer_outputs + (1.0 - g) * prev_hidden_outs
+
+            # IMPORTANT: write to a fresh clone to avoid autograd version-counter issues
+            hidden_states_interleaved = hidden_states_interleaved.clone()
             hidden_states_interleaved[:, 1::2, :] = blended_out
 
 
