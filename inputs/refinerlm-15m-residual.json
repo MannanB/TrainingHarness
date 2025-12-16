@@ -3,7 +3,7 @@
         "W&B_API_KEY": "",
         "wandb_user_name": "",
         "wandb_project_name": "",
-        "run_name": "refiner_15m_run_interleave_100m_tkns",
+        "run_name": "refiner_8m_run_residual_100m_tkns",
         "project_name": "refinerlm",
         "wandb_logging": true,
         "config": {
@@ -14,15 +14,15 @@
             "num_key_value_heads": 2,
             "head_dim": 16,
             "dropout_rate": 0.05,
-
+            
             "num_recursions": 4,
-            "recursion_version": 1,
+            "recursion_version": 0,
 
-            "chunk_size": 1024,
+            "chunk_size": 2048,
             "chunk_overlap": 128,
             "total_tokens": 100000000,
-            "batch_size": 2,
-            "grad_accum_steps": 64,
+            "batch_size": 3,
+            "grad_accum_steps": 43,
 
             "lr_max": 0.005,
             "adam_beta1": 0.9,

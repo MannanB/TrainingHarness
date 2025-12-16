@@ -178,8 +178,6 @@ class RefinerRecursiveGemma3TextModel(Gemma3PreTrainedModel):
             residual = hidden_states if residual_across_recursions else None
 
             for layer in self.layers:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
 
                 out = layer(
                     hidden_states,
@@ -202,10 +200,11 @@ class RefinerRecursiveGemma3TextModel(Gemma3PreTrainedModel):
             if residual is not None:
                 hidden_states = hidden_states + residual
 
-        hidden_states = self.norm(hidden_states)
+            if output_hidden_states:
+                all_hidden_states += (self.norm(hidden_states),)
 
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+
+        hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -333,7 +332,6 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        # NEW ARGS
         n_recursions: Optional[int] = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
@@ -448,8 +446,6 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
             # prev_hidden_outs = prev_hidden_outs.detach()
 
             for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states_interleaved[:, 0::2, :],)
 
                 layer_outputs = decoder_layer(
                     hidden_states_interleaved,
@@ -480,13 +476,14 @@ class RefinerInterleaveGemma3TextModel(Gemma3PreTrainedModel):
             hidden_states_interleaved = hidden_states_interleaved.clone()
             hidden_states_interleaved[:, 1::2, :] = blended_out
 
+            if output_hidden_states:                
+                normed = self.norm(hidden_states_interleaved)
+                all_hidden_states += (normed[:, 1::2, :],)
+
 
         # Final norm, then take ONLY the output tokens (odd positions)
         hidden_states_interleaved = self.norm(hidden_states_interleaved)
         final_hidden_states = hidden_states_interleaved[:, 1::2, :]  # (B, T, D)
-
-        if output_hidden_states:
-            all_hidden_states += (final_hidden_states,)
 
         return BaseModelOutputWithPast(
             last_hidden_state=final_hidden_states,

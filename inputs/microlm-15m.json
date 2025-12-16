@@ -3,8 +3,8 @@
         "W&B_API_KEY": "",
         "wandb_user_name": "",
         "wandb_project_name": "",
-        "run_name": "refiner_15m_run_interleave_100m_tkns",
-        "project_name": "refinerlm",
+        "run_name": "microlm_15m_run",
+        "project_name": "microlm",
         "wandb_logging": true,
         "config": {
             "hidden_size": 256,
@@ -15,16 +15,13 @@
             "head_dim": 16,
             "dropout_rate": 0.05,
 
-            "num_recursions": 4,
-            "recursion_version": 1,
-
-            "chunk_size": 1024,
+            "chunk_size": 2048,
             "chunk_overlap": 128,
             "total_tokens": 100000000,
-            "batch_size": 2,
-            "grad_accum_steps": 64,
+            "batch_size": 12,
+            "grad_accum_steps": 11,
 
-            "lr_max": 0.005,
+            "lr_max": 0.0008,
             "adam_beta1": 0.9,
             "adam_beta2": 0.95,
             "adam_eps": 1e-8,
@@ -34,8 +31,7 @@
             "dataset": "HuggingFaceTB/cosmopedia-100k",
             "dataset_split": "train",
             "dataset_field": "text",
-            "hf_token": "",
-            "test_samples_dataset": 1000
+            "hf_token": ""
         }
     }
 }

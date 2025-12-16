@@ -6,3 +6,4 @@ runpodctl.exe
 venv
 
 *.pt
+out
