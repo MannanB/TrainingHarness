@@ -1,6 +1,6 @@
 # Training Harness for ML/AI workloads
 
-Supports local training and runpod.io serverless. Designed for ablation testing and small-scale training.
+This is a simple training harness for ML/AI workloads. Currently I'm mainly using it to train LLMs/SLMs. Supports local training and runpod.io serverless. Designed for ablation testing and small-scale training.
 Uses wandb for logging for uploading models (HF Hub integration is planned)
 
 ## Setup
