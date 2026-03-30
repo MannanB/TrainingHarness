@@ -1,7 +1,8 @@
-# Training Harness for ML/AI workloads
+# Training Harness
 
-This is a simple training harness for ML/AI workloads. Currently I'm mainly using it to train LLMs/SLMs. Supports local training and runpod.io serverless. Designed for ablation testing and small-scale training.
-Uses wandb for logging for uploading models (HF Hub integration is planned)
+A lightweight training harness for ML and AI workloads, mainly focused on LLM and SLM experiments. It supports both local training and Runpod serverless workflows, and is designed for fast ablation testing and small-scale experimentation.
+
+It currently uses Weights & Biases for logging, with Hugging Face Hub integration planned.
 
 ## Setup
 
